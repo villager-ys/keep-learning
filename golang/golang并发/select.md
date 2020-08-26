@@ -1,4 +1,4 @@
-####前言
+#### 前言
 select select可以监听channel的数据流动，既可以用于channel的数据接收，也可以用于channel的数据发送。 select的用法与switch语法非常类似，由select开始的一个新的选择块，每个选择条件由case语句来描述，与switch语句可以选择任何使用相等比较的条件相比，select由比较多的限制，其中最大的一条限制就是每个case语句里必须是一个IO操作
 
 特性：
@@ -17,7 +17,7 @@ default:
 // 如果上面都没有成功，则进入default处理流程
 ```
 
-####select源码片段
+#### select源码片段
 ```
 func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
 	if debugSelect {

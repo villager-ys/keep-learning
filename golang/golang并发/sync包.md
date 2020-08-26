@@ -1,4 +1,4 @@
-####sync包中的type
+#### sync包中的type
 包中主要有: Locker, Cond, Map, Mutex, Once, Pool,kRWMutex, WaitGroup
 
 - Mutex: 互斥锁
@@ -9,7 +9,7 @@
 - Pool：临时对象池
 - Map：自带锁的map
 
-####sync.Mutex
+#### sync.Mutex
 sync.Mutex称为互斥锁，常用在并发编程里面。互斥锁需要保证的是同一个时间段内不能有多个并发协程同时访问某一个资源(临界区)。
 
 sync.Mutex有2个函数Lock和UnLock分别表示加锁和释放锁。
@@ -57,7 +57,7 @@ func (b *Bank) Out(account string, value float64) error {
 	return nil
 }
 ```
-####sync.RWMutex
+#### sync.RWMutex
 sync.RWMutex称为读写锁。
 
 RWMutex有5个函数，分别为读和写提供锁操作
@@ -74,7 +74,7 @@ RLocker()能获取读锁，然后传递给其他协程使用。
 func (rw *RWMutex) RLocker() Locker
 ```
 
-####sync.WaitGroup
+#### sync.WaitGroup
 sync.WaitGroup指的是等待组，在Golang并发编程里面非常常见，指的是等待一组工作完成后，再进行下一组工作
 
 sync.WaitGroup有3个函数
@@ -104,7 +104,7 @@ func main() {
 ```
 sync.WaitGroup没有办法指定最大并发协程数，在一些场景下会有问题。为了能够控制最大的并发数，推荐使用github.com/remeh/sizedwaitgroup，用法和sync.WaitGroup非常类似。
 
-####sync.Once
+#### sync.Once
 sync.Once指的是只执行一次的对象实现，常用来控制某些函数只能被调用一次。sync.Once的使用场景例如单例模式、系统初始化。
 
 sync.Once的结构如下所示，只有一个函数。使用变量done来记录函数的执行状态，使用sync.Mutex和sync.atomic来保证线程安全的读取done。
@@ -117,7 +117,7 @@ type Once struct {
 func (o *Once) Do(f func())
 ```
 
-####sync.Cond
+#### sync.Cond
 sync.Cond指的是同步条件变量，一般需要与互斥锁组合使用，本质上是一些正在等待某个条件的协程的同步机制。
 ```
 // NewCond returns a new Cond with Locker l.
@@ -180,7 +180,7 @@ func main() {
     wg.Wait()
 }
 ```
-####sync.Pool
+#### sync.Pool
 sync.Pool指的是临时对象池，Golang和Java具有GC机制，因此很多开发者基本上都不会考虑内存回收问题。
 
 Gc是一把双刃剑，带来了编程的方便但同时也增加了运行时开销，使用不当可能会严重影响程序的性能，因此性能要求高的场景不能任意产生太多的垃圾。
@@ -229,7 +229,7 @@ sync.Pool在init的时候注册了一个poolCleanup函数，它会清除所有�
 
 正因为如此sync.Pool适合用于缓存临时对象，而不适合用来做持久保存的对象池(连接池等)。
 
-####sync.Map
+#### sync.Map
 Go在1.9版本之前自带的map对象是不具有并发安全的，很多时候我们都得自己封装支持并发安全的Map结构，如下所示给map加个读写锁sync.RWMutex。
 ```
 type MapWithLock struct {
