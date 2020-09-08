@@ -15,7 +15,7 @@ runtime/runtime2.go
 
 ### G、M、P、schedt之间的关系
 
-![image](../images/mpg.png)
+![image](../images/gmp.png)
 
 ### G
 
