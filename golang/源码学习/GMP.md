@@ -944,6 +944,7 @@ runable入队列:
 2. 本地队列未满,加入本地队列;本地队列已满,则本地队列移一半到全局队列,再次尝试加入本地队列
 
 g小结
+
 ![image](../images/g.png)
 
 现在有了G,那存放G的P又是怎么来的呢？procresize
@@ -1131,7 +1132,7 @@ P小结：
 
 如果当前P在多余的P中，则将当前M和P解绑，再将M和P数组的第一P绑定，并设为running
 
-除了当前P外；所有P都设为idle，如果P中没有runnable,则将P加入全局空闲P,否则获取全局空闲M和P绑定
+除了当前P外；所有P都设为Pidle,也就是不和M关联，如果P中没有runable,则将P加入全局空闲P,否则获取全局空闲M和P绑定
 
 ```
 
@@ -1367,6 +1368,7 @@ func goexit0(gp *g) {
 ```
 
 M小结
+
 ![image](../images/m.png)
 
 就这么完了？ 不，还有一个独立的M
@@ -1527,4 +1529,5 @@ func retake(now int64) uint32 {
 ```
 
 sysmon小结:
+
 ![image](../images/specm.png)

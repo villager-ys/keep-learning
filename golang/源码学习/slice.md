@@ -142,25 +142,22 @@ func growslice(et *_type, old slice, cap int) slice {
     }
 
     var p unsafe.Pointer
-    if et.kind&kindNoPointers != 0 { //指针
-
-        // 申请一块地址
+    if et.kind&kindNoPointers != 0 { 
+        // 在老的切片后面继续扩充容量
         p = mallocgc(capmem, nil, false)
-        // 将以前的数据拷贝到新申请的地址中
+        // // 将 lenmem 这个多个 bytes 从 old.array地址 拷贝到 p 的地址处
         memmove(p, old.array, lenmem)
-        // The append() that calls growslice is going to overwrite from old.len to cap (which will be the new length).
-        // Only clear the part that will not be overwritten.
-
-        // 擦除未使用的地址
+        // 先将 P 地址加上新的容量得到新切片容量的地址，然后将新切片容量地址后面的 capmem-newlenmem 个 bytes 这块内存初始化。为之后继续 append() 操作腾出空间。
         memclrNoHeapPointers(add(p, newlenmem), capmem-newlenmem)
     } else {
-        // Note: can't use rawmem (which avoids zeroing of memory), because then GC can scan uninitialized memory.
-        // 申请一块地址
+        // 重新申请新的数组给新切片
+        // 重新申请 capmen 这个大的内存地址，并且初始化为0值
         p = mallocgc(capmem, et, true)
-        // 将以前的数据拷贝到新地址中
         if !writeBarrier.enabled {
+            // 如果还不能打开写锁，那么只能把 lenmem 大小的 bytes 字节从 old.array 拷贝到 p 的地址处
             memmove(p, old.array, lenmem)
         } else {
+            // 循环拷贝老的切片的值
             for i := uintptr(0); i < lenmem; i += et.size {
                 typedmemmove(et, add(p, i), add(old.array, i))
             }
@@ -170,4 +167,56 @@ func growslice(et *_type, old slice, cap int) slice {
     return slice{p, old.len, newcap}
 }
 ```
-在扩容的时候，明确调用了mallocgc重新申请地址， 为什么网上有些博文说“扩容之后可能还是原来的数组，因为可能底层数组还有空间” ？ 难道是我理解错了？
+上述就是扩容的实现。主要需要关注的有两点，一个是扩容时候的策略，还有一个就是扩容是生成全新的内存地址还是在原来的地址后追加。
+
+扩容策略:
+- 首先判断，如果新申请容量（cap）大于2倍的旧容量（old.cap），最终容量（newcap）就是新申请的容量（cap）
+- 否则判断，如果旧切片的长度小于1024，则最终容量(newcap)就是旧容量(old.cap)的两倍，即（newcap=doublecap）
+- 否则判断，如果旧切片长度大于等于1024，则最终容量（newcap）从旧容量（old.cap）开始循环增加原来的 1/4(1.25)，即（newcap=old.cap,for {newcap += newcap/4}）直到最终容量（newcap）大于等于新申请的容量(cap)，即（newcap >= cap）
+- 如果最终容量（cap）计算值溢出，则最终容量（cap）就是新申请容量（cap）
+
+扩容地址问题：扩容之后可能还是原来的数组，因为可能底层数组还有空间
+
+### slice copy
+```
+func slicecopy(to, fm slice, width uintptr) int {
+	// 如果源切片或者目标切片有一个长度为0，那么就不需要拷贝，直接 return 
+	if fm.len == 0 || to.len == 0 {
+		return 0
+	}
+	// n 记录下源切片或者目标切片较短的那一个的长度
+	n := fm.len
+	if to.len < n {
+		n = to.len
+	}
+	// 如果入参 width = 0，也不需要拷贝了，返回较短的切片的长度
+	if width == 0 {
+		return n
+	}
+	// 如果开启了竞争检测
+	if raceenabled {
+		callerpc := getcallerpc(unsafe.Pointer(&to))
+		pc := funcPC(slicecopy)
+		racewriterangepc(to.array, uintptr(n*int(width)), callerpc, pc)
+		racereadrangepc(fm.array, uintptr(n*int(width)), callerpc, pc)
+	}
+	// 如果开启了 The memory sanitizer (msan)
+	if msanenabled {
+		msanwrite(to.array, uintptr(n*int(width)))
+		msanread(fm.array, uintptr(n*int(width)))
+	}
+
+	size := uintptr(n) * width
+	if size == 1 { 
+		// TODO: is this still worth it with new memmove impl?
+		// 如果只有一个元素，那么指针直接转换即可
+		*(*byte)(to.array) = *(*byte)(fm.array) // known to be a byte pointer
+	} else {
+		// 如果不止一个元素，那么就把 size 个 bytes 从 fm.array 地址开始，拷贝到 to.array 地址之后
+		memmove(to.array, fm.array, size)
+	}
+	return n
+}
+```
+在这个方法中，slicecopy 方法会把源切片值(即 fm Slice )中的元素复制到目标切片(即 to Slice )中，并返回被复制的元素个数，copy 的两个类型必须一致。slicecopy 方法最终的复制结果取决于较短的那个切片，当较短的切片复制完成，整个复制过程就全部完成了。
+
