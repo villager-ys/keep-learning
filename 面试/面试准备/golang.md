@@ -76,10 +76,36 @@ slice struct:数组指针，len 元素个数,cap slice第一个元素到底层�
 
 slice copy: slicecopy 方法会把源切片值(即 fm Slice )中的元素复制到目标切片(即 to Slice )中，并返回被复制的元素个数，copy 的两个类型必须一致。slicecopy 方法最终的复制结果取决于较短的那个切片，当较短的切片复制完成，整个复制过程就全部完成了。
 
-### map如何顺序读取
-map的底层是hash table(hmap类型)，对key值进行了hash，并将结果的低八位用于确定key/value存在于哪个bucket（bmap类型）。再将高八位与bucket的tophash进行依次比较，确定是否存在。出现hash冲撞时，会通过bucket的overflow指向另一个bucket，形成一个单向链表。每个bucket存储8个键值对。
+### map
+golang中map比较重要的数据结构hmap和bmap,hmap中的buckets代表了存储数据的bucket数组，bmap则代表了map中bucket本体。
+每一个bmap最多放8个key和value，最后由一个overflow字段指向下一个bmap。
 
-如果要实现map的顺序读取，需要使用一个slice来存储map的key并按照顺序进行排序。
+查找：
+- 根据key计算出哈希值
+- 根据哈希值低位确定所在bucket
+- 根据哈希值高8位确定在bucket中的存储位置
+- 当前bucket未找到则查找对应的overflow bucket。
+- 对应位置有数据则对比完整的哈希值，确定是否是要查找的数据
+- 如果当前处于map进行了扩容，处于数据搬移状态，则优先从oldbuckets查找。
+
+插入：
+- 根据key计算出哈希值
+- 根据哈希值低位确定所在bucket
+- 根据哈希值高8位确定在bucket中的存储位置
+- 查找该key是否存在，已存在则更新，不存在则插入
+
+扩容：
+- 当链表越来越长，其实是扩容的加载因子达到6.5，buckets就会进行扩容，将原来bucket数组数量扩充一倍，产生一个新的bucket数组，也就是hmap的buckets属性指向的数组。这样hmap中的oldbuckets属性指向的就是旧bucket数组。
+- 这里的加载因子LoadFactor是一个阈值，计算方式为（元素个数/桶个数 ）如果超过6.5，将会进行扩容，这个是经过测试才得出的合理的一个阈值。因为，加载因子越小，空间利用率就小，加载因子越大，产生冲突的几率就大。所以6.5是一个平衡的值。
+- map的扩容不会立马全部复制，而是渐进式扩容，即首先开辟2倍的内存空间，创建一个新的bucket数组。只有当访问old bucket数组时，才会调用growWork()方法将old bucket中的元素拷贝到新的bucket数组，进行渐进式的扩容。当然旧的数据不会删除，而是去掉引用，等待gc回收
+
+删除：
+
+删除操作并不会释放内存：删除的核心就把对应的tophash设置为empty，而不是直接删除了内存里面的数据。
+
+map是并发不安全的，那么如何实现呢？
+
+新建一个struct，在map的基础上加RWMutex。或者直接使用sync.map
 
 ### 实现set
 利用map，如果要求并发安全，就用sync.map
