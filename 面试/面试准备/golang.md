@@ -52,6 +52,7 @@ select的几种场景：
 ### context
 goroutine管理、信息传递。context的意思是上下文，在线程、协程中都有这个概念，它指的是程序单元的一个运行状态、现场、快照，包含。context在多个goroutine中是并发安全的。
 
+
 ### 主协程如何等其余协程完再操作
 - waitgroup
 - channel
@@ -179,3 +180,23 @@ golang引用传递比一定比值传递效率高，传递指针相比值传递�
 - silce、map、channel等类型属于引用类型，引用类型初始化为nil，nil是不能直接赋值的
 
 ### channel实现
+channel底层是一个hchan的结构，由环形数据缓冲队列、类型信息、goroutine等待队列组成
+
+从一个channel读数据简单过程如下：
+
+- 如果等待发送队列sendq不为空，且没有缓冲区，直接从sendq中取出G，把G中数据读出，最后把G唤醒，结束读取过程；
+- 如果等待发送队列sendq不为空，此时说明缓冲区已满，从缓冲区中首部读出数据，把G中数据写入缓冲区尾部，把G唤醒，结束读取过程；
+- 如果缓冲区中有数据，则从缓冲区取出数据，结束读取过程；
+- 将当前goroutine加入recvq，进入睡眠，等待被写goroutine唤醒；
+
+向一个channel中写数据简单过程如下：
+
+- 如果等待接收队列recvq不为空，说明缓冲区中没有数据或者没有缓冲区，此时直接从recvq取出G,并把数据写入，最后把该G唤醒，结束发送过程；
+- 如果缓冲区中有空余位置，将数据写入缓冲区，结束发送过程；
+- 如果缓冲区中没有空余位置，将待发送数据写入G，将当前G加入sendq，进入睡眠，等待被读goroutine唤醒；
+
+关闭chan:
+
+关闭channel时会把recvq中的G全部唤醒，本该写入G的数据位置为nil。把sendq中的G全部唤醒，但这些G会panic。
+
+chansend、chanrecv、closechan发现里面都加了锁，所以chan是线程安全的

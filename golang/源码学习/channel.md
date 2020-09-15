@@ -14,8 +14,36 @@ type hchan struct {
     lock mutex // 互斥锁
 }
 ```
+从数据结构可以看出channel由队列、类型信息、goroutine等待队列组成，下面分别说明其原理。
+
+#### 环形队列
+chan内部实现了一个环形队列作为其缓冲区，队列的长度是创建chan时指定的。
+
+![image](../images/queue.jpg)
+
+- dataqsiz指示了队列长度为6，即可缓存6个元素；
+- buf指向队列的内存，队列中还剩余两个元素；
+- qcount表示队列中还有两个元素；
+- sendx指示后续写入的数据存储的位置，取值[0, 6)；
+- recvx指示从该位置读取数据, 取值[0, 6)；
+
+#### 等待队列
+- 从channel读数据，如果channel缓冲区为空或者没有缓冲区，当前goroutine会被阻塞。
+- 向channel写数据，如果channel缓冲区已满或者没有缓冲区，当前goroutine会被阻塞。
+     
+被阻塞的goroutine将会挂在channel的等待队列中：
+- 因读阻塞的goroutine会被向channel写入数据的goroutine唤醒；
+- 因写阻塞的goroutine会被从channel读数据的goroutine唤醒；
+
+#### 类型信息
+一个channel只能传递一种类型的值，类型信息存储在hchan数据结构中。
+
+- elemtype代表类型，用于数据传递过程中的赋值；
+- elemsize代表类型大小，用于在buf中定位元素位置。
 
 ### chan 创建
+创建channel的过程实际上是初始化hchan结构。其中类型信息和缓冲区长度由make语句传入，buf的大小则与元素大小和缓冲区长度共同决定。
+
 ```
 func makechan(t *chantype, size int) *hchan {
     elem := t.elem
@@ -69,7 +97,7 @@ func makechan(t *chantype, size int) *hchan {
     return c
 }
 ```
-### 消息发送
+### 从channel读数据,消息发送
 ```
 func chansend1(c *hchan, elem unsafe.Pointer) {
     chansend(c, elem, true, getcallerpc())
@@ -207,7 +235,16 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
     goready(gp, skip+1)
 }
 ```
-### 接收消息
+从一个channel读数据简单过程如下：
+
+- 如果等待发送队列sendq不为空，且没有缓冲区，直接从sendq中取出G，把G中数据读出，最后把G唤醒，结束读取过程；
+- 如果等待发送队列sendq不为空，此时说明缓冲区已满，从缓冲区中首部读出数据，把G中数据写入缓冲区尾部，把G唤醒，结束读取过程；
+- 如果缓冲区中有数据，则从缓冲区取出数据，结束读取过程；
+- 将当前goroutine加入recvq，进入睡眠，等待被写goroutine唤醒；
+
+![image](../images/sendq.png)
+
+### 向channel中写数据，接收消息
 ```
 func chanrecv1(c *hchan, elem unsafe.Pointer) {
     chanrecv(c, elem, true)
@@ -331,6 +368,13 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
     return true, !closed
 }
 ```
+向一个channel中写数据简单过程如下：
+
+- 如果等待接收队列recvq不为空，说明缓冲区中没有数据或者没有缓冲区，此时直接从recvq取出G,并把数据写入，最后把该G唤醒，结束发送过程；
+- 如果缓冲区中有空余位置，将数据写入缓冲区，结束发送过程；
+- 如果缓冲区中没有空余位置，将待发送数据写入G，将当前G加入sendq，进入睡眠，等待被读goroutine唤醒；
+![image](../images/recv.png)
+
 ### 关闭通道
 ```
 func closechan(c *hchan) {
@@ -412,4 +456,6 @@ func closechan(c *hchan) {
     }
 }
 ```
+关闭channel时会把recvq中的G全部唤醒，本该写入G的数据位置为nil。把sendq中的G全部唤醒，但这些G会panic。
+
 通过上面的chansend、chanrecv、closechan发现里面都加了锁，所以chan是线程安全的
