@@ -4,7 +4,7 @@
 - P M调度G的上下文, P中存储了很多G,M通过调用P来获取并执行G。
 - schedt - 全局调度器，主要存储了一些空闲的G、M、P,runable的G
 
-大致的启动流程：
+go程序启动的大致流程：
 1. 创建g0
 2. 创建m0
 3. m.g0 = g0
@@ -14,14 +14,11 @@
 7. newproc为main.main创建一个主goroutine
 8. mstart,运行主goroutine-->执行main.main
 
-go func(){}我们写的协程-->newproc获取func和参数-->切换到go，使用go栈空间，调用newproc1-->gfget从当前P获取空闲的G，此时如果当前P为空并且全局P不为空，则全局移动32个P到到本地，否则当前P中pop一个G，初始化栈空间-->判断获取G是否成功，不成功就创建一个G，初始化栈空间并加入全局G数组;成功就把参数复制到栈，清除G的运行现场，因为G有可能是从P中获取的，清除原有的数据-->状态设置成runable,设置goid-->runqput加入当前P的的runable队列，如果当前P的本地runable队列已满，则本地移除一半到全局-->有空闲的P且没有自旋的M，makep():添加一个P来执行goroutinue
+go func(){}我们写的协程，创建goroutine,调用newproc方法，newproc方法首先会获取func和参数，判断当前P本地是否有空闲G或是全局有没有空闲的G，如果都没有，则创建一个新的G,并设置成GDead状态，加入全局的G列表;如果本地没有空闲G而全局有，那么就全局空闲G列表移动32个到本地空闲G列表，从本地空闲G列表中pop一个G，初始化栈，把参数复制到栈，清除G的运行现场，因为G有可能是从P中获取的，清除原有的数据，状态设置成runable，调用runqput函数，加入当前P的runable的队列，如果本地runable队列已满，移动一半到全局，再次尝试加入，最后在判断有空闲的P且没有自旋的M，调用wakep()，wakep()获取全局空闲M和空闲P绑定，如果全局不存在空闲M新生成M，接下来唤醒M执行mstart，然后调用schedule来调度任务，schedule这个函数主要是找到一个runnable的g，然后调用execute来启动g，先从全局队列或是本地（P）的队列获取一个runable g，如果本地和全局都没有runable的g则调用findrunnable，findrunnable这个函数会阻塞知道找到一个可运行的g，调用execute执行找到的g，execute执行完后执行那个goexit,将G设置为GDead,G与M解绑，将G放入本地空闲列表，如果本地空闲个数大于64则移动一半到全局，继续调用schedule,不断的去获取G，执行G
 
 存放G的P怎么来的？
 在程序启动的时候有一个环节是schedinit，会调用procresize生成对应个数的P，这里我们就可以修改变量GOMAXPROCS来动态修改P的个数，所以在procresize中会对P数组进行调整，或新增P或减少P。被减少的P会将自身的runable、runnext、gfee移到全局去。
-除了当前P外，所有P都设为Pidle,也就是不和M关联，如果P中没有runable,则将P加入全局空闲P,否则获取全局空闲M和P绑定
-
-M从何而来？
-有空闲P且没有自旋的M，makep()-->statrm,全局去获取空闲M，成功就将M和空闲P绑定，否则就创建一个M和空闲P绑定，唤醒M-->执行mstatr/mstart1-->开始循环schedule，从P本地或是全局获取runable的G，获取成功则G与M绑定，G设置成running,执行完成后goexit，将G设置成Dead，将G与M解绑，将G加入P的空闲的链表，如果本地空闲个数大于64则移一半到全局空闲G队列;如果P本地或是全局没有获取到runable的G，则阻塞在本地，全局，网络，其他P中获取，如果获取成功就同样执行上面过程，否则M与P解绑，P加入全局，M加入全局M，M休眠
+除了当前P外，所有P都设为Pidle,也就是不和M关联，如果P中没有runable的G,则将P加入全局空闲P,否则获取全局空闲M和P绑定
 
 ### g0 
 g0 这样一个特殊的 goroutine,用来创建 goroutine、deferproc 函数里新建 _defer、垃圾回收相关的工作（例如 stw、扫描 goroutine 的执行栈、一些标识清扫的工作、栈增长）等等。
@@ -182,18 +179,22 @@ golang引用传递比一定比值传递效率高，传递指针相比值传递�
 ### channel实现
 channel底层是一个hchan的结构，由环形数据缓冲队列、类型信息、goroutine等待队列组成
 
-从一个channel读数据简单过程如下：
+make chan实际上就是初始化hchan结构的过程
 
-- 如果等待发送队列sendq不为空，且没有缓冲区，直接从sendq中取出G，把G中数据读出，最后把G唤醒，结束读取过程；
-- 如果等待发送队列sendq不为空，此时说明缓冲区已满，从缓冲区中首部读出数据，把G中数据写入缓冲区尾部，把G唤醒，结束读取过程；
-- 如果缓冲区中有数据，则从缓冲区取出数据，结束读取过程；
-- 将当前goroutine加入recvq，进入睡眠，等待被写goroutine唤醒；
+从一个channel读数据简单过程如下：
+1. 先获取channel全局锁
+2. 尝试从sendq等待队列中获取等待的goroutine，
+3. 如有等待的goroutine，没有缓冲区，取出goroutine并读取数据，然后唤醒这个goroutine，结束读取释放锁。
+4. 如有等待的goroutine，且有缓冲区（此时缓冲区已满），从缓冲区队首取出数据，再从sendq取出一个goroutine，将goroutine中的数据存入buf队尾，结束读取释放锁。
+5. 如没有等待的goroutine，且缓冲区有数据，直接读取缓冲区数据，结束读取释放锁。
+6. 如没有等待的goroutine，且没有缓冲区或缓冲区为空，将当前的goroutine加入recvq排队，进入睡眠，等待被写goroutine唤醒。结束读取释放锁。
 
 向一个channel中写数据简单过程如下：
-
-- 如果等待接收队列recvq不为空，说明缓冲区中没有数据或者没有缓冲区，此时直接从recvq取出G,并把数据写入，最后把该G唤醒，结束发送过程；
-- 如果缓冲区中有空余位置，将数据写入缓冲区，结束发送过程；
-- 如果缓冲区中没有空余位置，将待发送数据写入G，将当前G加入sendq，进入睡眠，等待被读goroutine唤醒；
+1. 锁定整个通道结构。
+2. 确定写入。尝试从recvq等待队列中取一个g，然后将元素直接写入goroutine。
+3. 如果recvq为Empty，则确定缓冲区是否可用。如果可用，从当前goroutine复制数据到缓冲区。
+4. 如果缓冲区已满，则要写入的元素将保存在当前正在执行的goroutine的结构中，并且当前goroutine加入sendq中并挂起，等待被唤醒。
+5. 写入完成释放锁。
 
 关闭chan:
 
