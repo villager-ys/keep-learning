@@ -5,13 +5,17 @@ golang GC 采用基于标记-清除的三色标记法，下图为 golang 一轮�
 
 一轮完整的 GC，总是从 Off，如果不是 Off 状态，则代表上一轮GC还未完成，如果这时修改指针的值，是直接修改的。
 
-Stack scan: 收集根对象（全局变量和 goroutine 栈上的变量），该阶段会开启写屏障(Write Barrier)。
+Stack scan: 收集根对象（全局变量和 goroutine 栈上的变量），收集根对象（全局变量，和G stack），开启写屏障。全局变量开启写屏障需要STW，G stack只需要停止该G就好，时间比较少。。
 
 Mark: 标记对象，直到标记完所有根对象和根对象可达对象。此时写屏障会记录所有指针的更改(通过 mutator)。
 
 Mark Termination: 重新扫描部分全局变量和发生更改的栈变量，完成标记，该阶段会STW(Stop The World)，也是 gc 时造成 go 程序停顿的主要阶段。
 
 Sweep: 并发的清除未标记的对象。
+
+目前整个GC流程会进行两次STW(Stop The World), 第一次是Stack scan阶段, 第二次是Mark Termination阶段.
+
+从1.8以后的golang将第一步的stop the world 也取消了，这又是一次优化； 1.9开始, 写屏障的实现使用了Hybrid Write Barrier, 大幅减少了第二次STW的时间.
 
 ### 三色标记
 以上 Mark 阶段，采用的是三色标记法，是传统标记-清除算法的一种优化，主要思想是增加了一种中间状态，即灰色对象，以减少 STW 时间。

@@ -56,7 +56,7 @@ goroutine管理、信息传递。context的意思是上下文，在线程、协�
 
 ### slice，len，cap，共享，扩容
 
-slice struct:数组指针，len 元素个数,cap slice第一个元素到底层数组的最后一个元素的长度,扩容是以这个值为标准
+slice struct:array指针，len 元素个数,cap slice第一个元素到底层数组的最后一个元素的长度,扩容是以这个值为标准
 
 扩容(不是并发安全)的实现需要关注的有两点，一个是扩容时候的策略，还有一个就是扩容是生成全新的内存地址还是在原来的地址后追加。
 
@@ -131,11 +131,14 @@ sync.Map
 ### go GC
 
 golang GC 采用基于标记-清除的三色标记法。大约经历如下几步:
-
-1. Stack scan: 收集根对象（全局变量和 goroutine 栈上的变量），该阶段会开启写屏障(Write Barrier)。
+1. Stack scan: 收集根对象（全局变量和 goroutine 栈上的变量），收集根对象（全局变量，和G stack），开启写屏障。全局变量开启写屏障需要STW，G stack只需要停止该G就好，时间比较少。。
 2. Mark: 标记对象，直到标记完所有根对象和根对象可达对象。此时写屏障会记录所有指针的更改(通过 mutator)。
 3. Mark Termination: 重新扫描部分全局变量和发生更改的栈变量，完成标记，该阶段会STW(Stop The World)，也是 gc 时造成 go 程序停顿的主要阶段。
 4. Sweep: 并发的清除未标记的对象。
+
+目前整个GC流程会进行两次STW(Stop The World), 第一次是Stack scan阶段, 第二次是Mark Termination阶段.
+
+从1.8以后的golang将第一步的stop the world 也取消了，这又是一次优化； 1.9开始, 写屏障的实现使用了Hybrid Write Barrier, 大幅减少了第二次STW的时间.
 
 什么是三色标记?
 
@@ -144,6 +147,11 @@ golang GC 采用基于标记-清除的三色标记法。大约经历如下几步
 - 黑色：已标记的对象，表示对象是根对象可达的。
 - 白色：未标记对象，gc开始时所有对象为白色，当gc结束时，如果仍为白色，说明对象不可达，在 sweep 阶段会被清除。
 - 灰色：被黑色对象引用到的对象，但其引用的自对象还未被扫描，灰色为标记过程的中间状态，当灰色对象全部被标记完成代表本次标记阶段结束。
+
+什么时候触发:
+- 阈值：默认内存扩大一倍，启动gc
+- 定期：默认2min触发一次gc，src/runtime/proc.go:forcegcperiod
+- 手动：runtime.gc()
 
 ### 当go服务部署到线上了，发现有内存泄露，该怎么处理
 
@@ -201,3 +209,14 @@ make chan实际上就是初始化hchan结构的过程
 关闭channel时会把recvq中的G全部唤醒，本该写入G的数据位置为nil。把sendq中的G全部唤醒，但这些G会panic。
 
 chansend、chanrecv、closechan发现里面都加了锁，所以chan是线程安全的
+
+#### go内存分配
+
+#### sync.Once
+
+#### 内存对齐
+
+#### sync.Pool
+整个设计充分利用了go.runtime的调度器优势：一个P下goroutine竞争的无锁化；
+     
+一个goroutine固定在一个局部调度器P上，从当前 P 对应的 poolLocal 取值， 若取不到，则从对应的 shared 数组上取，若还是取不到；则尝试从其他 P 的 shared 中偷。 若偷不到，则调用 New 创建一个新的对象。池中所有临时对象在一次 GC 后会被全部清空。
