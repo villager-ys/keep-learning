@@ -17,9 +17,42 @@ go程序启动的大致流程：
 go func(){}我们写的协程，创建goroutine,调用newproc方法，newproc方法首先会获取func和参数，判断当前P本地是否有空闲G或是全局有没有空闲的G，如果都没有，则创建一个新的G,并设置成GDead状态，加入全局的G列表;如果本地没有空闲G而全局有，那么就全局空闲G列表移动32个到本地空闲G列表，从本地空闲G列表中pop一个G，初始化栈，把参数复制到栈，清除G的运行现场，因为G有可能是从P中获取的，清除原有的数据，状态设置成runable，调用runqput函数，加入当前P的runable的队列，如果本地runable队列已满，移动一半到全局，再次尝试加入，最后在判断有空闲的P且没有自旋的M，调用wakep()，wakep()获取全局空闲M和空闲P绑定，如果全局不存在空闲M新生成M，接下来唤醒M执行mstart，然后调用schedule来调度任务，schedule这个函数主要是找到一个runnable的g，然后调用execute来启动g，先从全局队列或是本地（P）的队列获取一个runable g，如果本地和全局都没有runable的g则调用findrunnable，findrunnable这个函数会阻塞知道找到一个可运行的g，调用execute执行找到的g，execute执行完后执行那个goexit,将G设置为GDead,G与M解绑，将G放入本地空闲列表，如果本地空闲个数大于64则移动一半到全局，继续调用schedule,不断的去获取G，执行G
 
 存放G的P怎么来的？
+
 在程序启动的时候有一个环节是schedinit，会调用procresize生成对应个数的P，这里我们就可以修改变量GOMAXPROCS来动态修改P的个数，所以在procresize中会对P数组进行调整，或新增P或减少P。被减少的P会将自身的runable、runnext、gfee移到全局去。
 除了当前P外，所有P都设为Pidle,也就是不和M关联，如果P中没有runable的G,则将P加入全局空闲P,否则获取全局空闲M和P绑定
 
+抢占式调度实现(sysmon线程):
+
+runtime.main会创建一个额外的M运行sysmon函数，抢占式调度就是在sysmon中实现的。
+
+sysmon中有netpool(获取fd事件)，retake(抢占)，forcegc(按时间强制执行gc),scavenge heap(释放自由列表中多余的项减少内存占用)等处理。
+
+retake函数负责处理抢占，流程是:
+
+- 枚举所有的P：
+
+如果P在系统调用中(_Psyscall), 且经过了一次sysmon循环(20us~10ms), 则抢占这个P
+
+调用handoffp解除M和P之间的关联
+
+如果P在运行中(_Prunning), 且经过了一次sysmon循环并且G运行时间超过forcePreemptNS(10ms), 则抢占这个P
+
+调用preemptone函数
+
+设置g.preempt = true
+
+设置g.stackguard0 = stackPreempt
+
+stackguard0这个值用于检查当前栈空间是否需要扩张栈，stackPreempt是一个特殊的常量, 它的值会比任何的栈地址都要大, 检查时一定会触发栈扩张.栈扩张是会保存G的状态到g.sched, 切换到g0和g0的栈空间, 然后调用newstack函数。
+newstack函数判断g.stackguard0等于stackPreempt, 就知道这是抢占触发的, 这时会再检查一遍是否要抢占：
+- 如果M被锁定(函数的本地变量中有P), 则跳过这一次的抢占并调用gogo函数继续运行G
+- 如果M正在分配内存, 则跳过这一次的抢占并调用gogo函数继续运行G
+- 如果M设置了当前不能抢占, 则跳过这一次的抢占并调用gogo函数继续运行G
+- 如果M的状态不是运行中, 则跳过这一次的抢占并调用gogo函数继续运行G
+
+即使这一次抢占失败, 因为g.preempt等于true, runtime中的一些代码会重新设置stackPreempt以重试下一次的抢占。
+如果判断可以抢占, 则继续判断是否GC引起的, 如果是则对G的栈空间执行标记处理(扫描根对象)然后继续运行。
+如果不是GC引起的则调用gopreempt_m函数完成抢占。
 ### g0 
 g0 这样一个特殊的 goroutine,用来创建 goroutine、deferproc 函数里新建 _defer、垃圾回收相关的工作（例如 stw、扫描 goroutine 的执行栈、一些标识清扫的工作、栈增长）等等。
 
@@ -211,10 +244,37 @@ make chan实际上就是初始化hchan结构的过程
 chansend、chanrecv、closechan发现里面都加了锁，所以chan是线程安全的
 
 #### go内存分配
+Go语言内置运行时（就是runtime），抛弃了传统的内存分配方式,而是在程序启动时，会先向操作系统申请一块内存，自己进行管理。
+
+申请到的内存块被分配了三个区域，arena(堆区)，bitmap区(arena区域哪些地址保存了对象),spans(存放mspan的指针，每个指针对应一页)。mspan也叫内存管理单元是一个包含起始地址、mspan规格、页的数量等内容的双端链表。
+
+内存管理组件分为:
+- mcache:每个线程M会绑定给一个处理器P，而每个P都会绑定一个上面说的本地缓存mcache，这样就可以直接给Goroutine分配，因为不存在多个Goroutine竞争的情况，所以不会消耗锁资源。mcache在初始化的时候是没有任何mspan资源的，在使用过程中会动态地从mcentral申请，之后会缓存下来。
+- mcentral: 为所有mcache提供切分好的mspan资源。每个central保存一种特定大小的全局mspan列表。当工作goroutine的P中mcache没有合适的mspan时就会从mcentral获取。mcentral被所有的工作线程共同享有，存在多个Goroutine竞争的情况，因此会消耗锁资源。
+- mheap:代表Go程序持有的所有堆空间。当mcentral没有空闲的mspan时，会向mheap申请。而mheap没有资源时，会向操作系统申请新内存。mheap主要用于大对象的内存分配，以及管理未切割的mspan，用于给mcentral切割成小对象。
+
+分配流程：
+
+Go的内存分配器在分配对象时，根据对象的大小，分成三类：小对象（小于等于16B）、一般对象（大于16B，小于等于32KB）、大对象（大于32KB）。
+
+大体上的分配流程：
+- 大于32KB 的对象，直接从mheap上分配；
+- <=16B 的对象使用mcache的tiny分配器分配；
+- (16B,32KB] 的对象，首先计算对象的规格大小，然后使用mcache中相应规格大小的mspan分配；
+- 如果mcache没有相应规格大小的mspan，则向mcentral申请
+- 如果mcentral没有相应规格大小的mspan，则向mheap申请
+- 如果mheap中也没有合适大小的mspan，则向操作系统申请
+
+
 
 #### sync.Once
 
 #### 内存对齐
+Go编译器可能会在结构体的相邻字段之间填充一些字节。 这使得一个结构体类型的尺寸并非等于它的各个字段类型尺寸的简单相加之和,这种现象称为内存对齐
+
+#### 为什么要内存对齐
+- 平台问题：并不是所有的硬件平台都能访问任意地址上的任意数据。
+- 性能问题：访问未对齐内存需要cpu进行两次访问，对齐后只需要一次。
 
 #### sync.Pool
 整个设计充分利用了go.runtime的调度器优势：一个P下goroutine竞争的无锁化；
