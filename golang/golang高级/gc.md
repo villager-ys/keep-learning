@@ -44,3 +44,12 @@ golang 程序的执行过程中，如下几种情况下会触发 GC:
 - 默认每 2min 未产生 GC 时，golang 的守护协程 sysmon 会强制触发 GC
 - 当 go 程序分配的内存增长超过阈值时，会触发 GC
 
+### panic和recover
+- 获取指向当前 Goroutine
+- 初始化一个 panic 的基本单位 _panic，并将这个panic头插入当前goroutine的panic链表中。
+- 获取当前 Goroutine 上挂载的 _defer链表
+- 若当前存在 defer 调用，则调用 reflectcall 方法去执行先前 defer 中延迟执行的代码。reflectcall方法若在执行过程中需要运行 recover 将会调用 gorecover 方法,修改当前 panic recovered字段。
+- 判断当前 _panic 中的 recover 是否已标注为处理
+- 从 _panic 链表中删除已标注中止的 panic 事件，也就是删除已经被恢复的 panic 事件
+- 执行 recovery 进行恢复动作
+- 如果没有恢复最后调用 fatalpanic 中止应用程序
