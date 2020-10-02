@@ -304,3 +304,18 @@ func (sched *Scheduler) Run() {
 }
 ```
 sched.scheduleOne是kube-scheduler的主逻辑，他通过waitUntil定时器执行，内部会地那是调用sched.scheduleOne函数，当sched.config.StopEverything Chan关闭时，该定时器才会停止并退出
+
+## 调度器运行流程
+流程如图所示
+
+![image](../images/scheduler-runtime.png)
+
+kube-scheduler调度器在启动过程中实例化并运行了很多Informer,其中podInformer和nodeInformer用于同步api-server上的资源。podInformer将watch到的Pod资源事件分别存储中调度队列(SchedulingQueue)和调度缓存(SchedulingCache)中。nodeInformer将监控到的node资源时间存储至调度缓存中。
+- 调度队列：存储了带调度的Pod资源对象。调度队列的实现方式有两种，分别是FIFO(先入先出队列)和PriorityQueue(优先级队列)。
+- 调度缓存：存储了调度过程中使用到的Pod和Node资源信息
+
+scheduleOne函数实现了kube-scheduler调度器的核心逻辑，它的逻辑只要分四步：
+- 1，通过sched.config.NextPod函数从优先级队列中获取一个最高的带调度的Pod资源，该过程是阻塞的，当优先级队列中不存在任何Pod资源对象时，该函数处于等待状态
+- 2，通过sched.schedule(pod)函数执行预选调度算法和优选调度算法，为pod选择一个合适的节点
+- 3,当高优先级的Pod资源对象没有找到合适的节点，调度器会通过sched.preempt函数尝试抢占低优先级的pod资源对象的节点
+- 4,当调度器为pod选择了一个合适的节点，通过sched.bind函数将合适的节点与pod绑定在一起
