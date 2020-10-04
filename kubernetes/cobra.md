@@ -38,8 +38,8 @@ matebook-x-pro:local ywq$ go run main.go
 # 因需要多次测试，这里所有的测试步骤就把build的步骤跳过，直接使用go run main.go进行测试
 ```
 **我们打开IDE来查看一下testapp的代码结构:**
-![image](./源码分析/images/cobra1.jpg)
-![image](./源码分析/images/cobra2.jpg)
+![image](images/cobra1.jpg)
+![image](images/cobra2.jpg)
 
 ```
 # 现在还未创建子命令，那么来创建几个试试:
@@ -72,7 +72,7 @@ add called
 ```
 
 **来看看新增的子命令是怎么运行的呢？**
-![image](./源码分析/images/cobra3.jpg)
+![image](images/cobra3.jpg)
 截图圈中部分可以看出，子命令是在init()函数里为root级添加了一个子命令，先不去管底层实现，接着往下.
 
 **测试cobra的强大简洁的flag处理**
@@ -83,7 +83,7 @@ deleteCmd.PersistentFlags().StringVar(&obj,"object", "", "A function to delete a
 ```
 在`Run:func()`匿名函数中添加一行输出:
 `fmt.Println("delete obj:",cmd.Flag("object").Value)`
-![image](./源码分析/images/cobra4.jpg)
+![image](images/cobra4.jpg)
 
 运行结果:
 
@@ -94,7 +94,7 @@ delete obj: obj1
 
 ```
 如果觉得`--`flag符号太麻烦，cobra同样支持短符号`-`flag缩写:
-![image](./源码分析/images/cobra5.jpg)
+![image](images/cobra5.jpg)
 
 运行结果:
 
@@ -114,7 +114,7 @@ add.go          delete.go       get.go          pods.go         root.go         
 
 ```
 可以发现,cmd/目录下多了一个pods.go文件，我们来看看它是怎么关联上delete父级命令的,同时为它添加一行输出:
-![image](./源码分析/images/cobra6.jpg)
+![image](images/cobra6.jpg)
 执行命令:
 
 ```
