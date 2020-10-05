@@ -1,0 +1,1102 @@
+# calico,CNI的一种实现
+
+CNI(container network interface)是K8s 中标准的一个调用网络实现的接口。实现了这个接口的就是 CNI 插件，它实现了一系列的 CNI API 接口。Kubelet 通过这个标准的 API 来调用不同的CNI插件以实现不同的网络配置方式，为pod配置网络。常见的 CNI 插件包括 calico、flannel。今天就来学习一下calico的具体实现。
+<a name="ltmEJ"></a>
+# 1.CNI
+calico是CNI的其中一种实现，因此有必要先了解一下CNI。配置pod网络是在kubelet调谐pod状态的时候发生的，调谐pod状态是k8s的一种设计，k8s使用声明式API提交一个定义好的 API 对象来声明所期望的状态是什么样子，kubelet就负责完成对“实际状态”和“期望状态”的调谐过程，所以这里先从kubelet调用SyncPod()开始分析，SyncPod()在创建pod或者pod的网络变化时会调用createPodSandbox()。<br />createPodSandbox()首先调用generatePodSandboxConfig()生成sandbox的配置，其中有声明pod的日志存储在宿主机的目录/var/log/pods/$pod.Namespace_$pod.Name-$pod.UID，然后调用MkdirAll()把日志目录创建出来，我们平时使用kubectl logs -f $podname命令获取的日志就是从这里拿到的，最后调用RuntimeService.RunPodSandbox()来创建podsandbox，配置pod需要的网络环境也是从这里开始。
+```go
+/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go
+func (m *kubeGenericRuntimeManager) createPodSandbox(pod *v1.Pod, attempt uint32) (string, string, error) {
+	podSandboxConfig, err := m.generatePodSandboxConfig(pod, attempt)
+	if err != nil {
+		message := fmt.Sprintf("GeneratePodSandboxConfig for pod %q failed: %v", format.Pod(pod), err)
+		klog.Error(message)
+		return "", message, err
+	}
+
+	// Create pod logs directory
+	err = m.osInterface.MkdirAll(podSandboxConfig.LogDirectory, 0755)
+	if err != nil {
+		message := fmt.Sprintf("Create pod log directory for pod %q failed: %v", format.Pod(pod), err)
+		klog.Errorf(message)
+		return "", message, err
+	}
+
+	runtimeHandler := ""
+	if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClass) && m.runtimeClassManager != nil {
+		runtimeHandler, err = m.runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)
+		if err != nil {
+			message := fmt.Sprintf("CreatePodSandbox for pod %q failed: %v", format.Pod(pod), err)
+			return "", message, err
+		}
+		if runtimeHandler != "" {
+			klog.V(2).Infof("Running pod %s with RuntimeHandler %q", format.Pod(pod), runtimeHandler)
+		}
+	}
+
+	podSandBoxID, err := m.runtimeService.RunPodSandbox(podSandboxConfig, runtimeHandler)
+	if err != nil {
+		message := fmt.Sprintf("CreatePodSandbox for pod %q failed: %v", format.Pod(pod), err)
+		klog.Error(message)
+		return "", message, err
+	}
+
+	return podSandBoxID, "", nil
+}
+```
+RunPodSandbox()首先获取pause镜像，然后创建infra容器，这里就是为什么我们创建的每个pod里都有一个pause镜像的infra容器存在，这个容器的网络模式是none模式，会创建自己network namespace，我们要学习的为pod配置网络环境实际上就是给这个infra容器配置网络环境，而之后在pod里创建的业务容器网络模式是container模式，不需要再次配置网络环境，会直接让业务容器和infra容器共享infra容器的network namespace，当然也就会共享infra容器的网络环境比如ip，端口等，这也是为什么一个pod里的所有容器都可以通过同一个pod ip访问。<br />接下来就通过SetupPod()开始调用CNI插件，其中需要注意的是如果pod的网络模式是hostNetwork时，就不需要调用CNI插件了，pod的所有容器会使用宿主机的网络环境，可以验证这时pod的ip就是宿主机的ip。
+```go
+/pkg/kubelet/dockershim/docker_sandbox.go
+func (ds *dockerService) RunPodSandbox(ctx context.Context, r *runtimeapi.RunPodSandboxRequest) (*runtimeapi.RunPodSandboxResponse, error) {
+	config := r.GetConfig()
+
+	// Step 1: Pull the image for the sandbox.
+	image := defaultSandboxImage
+	podSandboxImage := ds.podSandboxImage
+	if len(podSandboxImage) != 0 {
+		image = podSandboxImage
+	}
+
+	// NOTE: To use a custom sandbox image in a private repository, users need to configure the nodes with credentials properly.
+	// see: http://kubernetes.io/docs/user-guide/images/#configuring-nodes-to-authenticate-to-a-private-repository
+	// Only pull sandbox image when it's not present - v1.PullIfNotPresent.
+	if err := ensureSandboxImageExists(ds.client, image); err != nil {
+		return nil, err
+	}
+
+	// Step 2: Create the sandbox container.
+	if r.GetRuntimeHandler() != "" && r.GetRuntimeHandler() != runtimeName {
+		return nil, fmt.Errorf("RuntimeHandler %q not supported", r.GetRuntimeHandler())
+	}
+	createConfig, err := ds.makeSandboxDockerConfig(config, image)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make sandbox docker config for pod %q: %v", config.Metadata.Name, err)
+	}
+	createResp, err := ds.client.CreateContainer(*createConfig)
+	if err != nil {
+		createResp, err = recoverFromCreationConflictIfNeeded(ds.client, *createConfig, err)
+	}
+
+	if err != nil || createResp == nil {
+		return nil, fmt.Errorf("failed to create a sandbox for pod %q: %v", config.Metadata.Name, err)
+	}
+	resp := &runtimeapi.RunPodSandboxResponse{PodSandboxId: createResp.ID}
+
+	ds.setNetworkReady(createResp.ID, false)
+	defer func(e *error) {
+		// Set networking ready depending on the error return of
+		// the parent function
+		if *e == nil {
+			ds.setNetworkReady(createResp.ID, true)
+		}
+	}(&err)
+
+	// Step 3: Create Sandbox Checkpoint.
+	if err = ds.checkpointManager.CreateCheckpoint(createResp.ID, constructPodSandboxCheckpoint(config)); err != nil {
+		return nil, err
+	}
+
+	// Step 4: Start the sandbox container.
+	// Assume kubelet's garbage collector would remove the sandbox later, if
+	// startContainer failed.
+	err = ds.client.StartContainer(createResp.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start sandbox container for pod %q: %v", config.Metadata.Name, err)
+	}
+
+	// Rewrite resolv.conf file generated by docker.
+	// NOTE: cluster dns settings aren't passed anymore to docker api in all cases,
+	// not only for pods with host network: the resolver conf will be overwritten
+	// after sandbox creation to override docker's behaviour. This resolv.conf
+	// file is shared by all containers of the same pod, and needs to be modified
+	// only once per pod.
+	if dnsConfig := config.GetDnsConfig(); dnsConfig != nil {
+		containerInfo, err := ds.client.InspectContainer(createResp.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect sandbox container for pod %q: %v", config.Metadata.Name, err)
+		}
+
+		if err := rewriteResolvFile(containerInfo.ResolvConfPath, dnsConfig.Servers, dnsConfig.Searches, dnsConfig.Options); err != nil {
+			return nil, fmt.Errorf("rewrite resolv.conf failed for pod %q: %v", config.Metadata.Name, err)
+		}
+	}
+
+	// Do not invoke network plugins if in hostNetwork mode.
+	if config.GetLinux().GetSecurityContext().GetNamespaceOptions().GetNetwork() == runtimeapi.NamespaceMode_NODE {
+		return resp, nil
+	}
+
+	// Step 5: Setup networking for the sandbox.
+	// All pod networking is setup by a CNI plugin discovered at startup time.
+	// This plugin assigns the pod ip, sets up routes inside the sandbox,
+	// creates interfaces etc. In theory, its jurisdiction ends with pod
+	// sandbox networking, but it might insert iptables rules or open ports
+	// on the host as well, to satisfy parts of the pod spec that aren't
+	// recognized by the CNI standard yet.
+	cID := kubecontainer.BuildContainerID(runtimeName, createResp.ID)
+	networkOptions := make(map[string]string)
+	if dnsConfig := config.GetDnsConfig(); dnsConfig != nil {
+		// Build DNS options.
+		dnsOption, err := json.Marshal(dnsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal dns config for pod %q: %v", config.Metadata.Name, err)
+		}
+		networkOptions["dns"] = string(dnsOption)
+	}
+	err = ds.network.SetUpPod(config.GetMetadata().Namespace, config.GetMetadata().Name, cID, config.Annotations, networkOptions)
+	if err != nil {
+		errList := []error{fmt.Errorf("failed to set up sandbox container %q network for pod %q: %v", createResp.ID, config.Metadata.Name, err)}
+
+		// Ensure network resources are cleaned up even if the plugin
+		// succeeded but an error happened between that success and here.
+		err = ds.network.TearDownPod(config.GetMetadata().Namespace, config.GetMetadata().Name, cID)
+		if err != nil {
+			errList = append(errList, fmt.Errorf("failed to clean up sandbox container %q network for pod %q: %v", createResp.ID, config.Metadata.Name, err))
+		}
+
+		err = ds.client.StopContainer(createResp.ID, defaultSandboxGracePeriod)
+		if err != nil {
+			errList = append(errList, fmt.Errorf("failed to stop sandbox container %q for pod %q: %v", createResp.ID, config.Metadata.Name, err))
+		}
+
+		return resp, utilerrors.NewAggregate(errList)
+	}
+
+	return resp, nil
+}
+```
+里面会调用plugin的SetUpPod(),这里plugin是个接口，具体是哪个plugin由kubelet的启动参数--network-plugin决定，不过目前对于docker来说只支持cni一种。
+```go
+/pkg/kubelet/dockershim/network/plugins.go
+func (pm *PluginManager) SetUpPod(podNamespace, podName string, id kubecontainer.ContainerID, annotations, options map[string]string) error {
+	defer recordOperation("set_up_pod", time.Now())
+	fullPodName := kubecontainer.BuildPodFullName(podName, podNamespace)
+	pm.podLock(fullPodName).Lock()
+	defer pm.podUnlock(fullPodName)
+
+	klog.V(3).Infof("Calling network plugin %s to set up pod %q", pm.plugin.Name(), fullPodName)
+	if err := pm.plugin.SetUpPod(podNamespace, podName, id, annotations, options); err != nil {
+		return fmt.Errorf("networkPlugin %s failed to set up pod %q network: %v", pm.plugin.Name(), fullPodName, err)
+	}
+
+	return nil
+}
+```
+cni plugin调用的SetUpPod()会首先获取namespace path，然后调用addToNetwork()。
+```go
+/pkg/kubelet/dockershim/network/cni/cni.go
+func (plugin *cniNetworkPlugin) SetUpPod(namespace string, name string, id kubecontainer.ContainerID, annotations, options map[string]string) error {
+	if err := plugin.checkInitialized(); err != nil {
+		return err
+	}
+	netnsPath, err := plugin.host.GetNetNS(id.ID)
+	if err != nil {
+		return fmt.Errorf("CNI failed to retrieve network namespace path: %v", err)
+	}
+
+	// Todo get the timeout from parent ctx
+	cniTimeoutCtx, cancelFunc := context.WithTimeout(context.Background(), network.CNITimeoutSec*time.Second)
+	defer cancelFunc()
+	// Windows doesn't have loNetwork. It comes only with Linux
+	if plugin.loNetwork != nil {
+		if _, err = plugin.addToNetwork(cniTimeoutCtx, plugin.loNetwork, name, namespace, id, netnsPath, annotations, options); err != nil {
+			return err
+		}
+	}
+
+	_, err = plugin.addToNetwork(cniTimeoutCtx, plugin.getDefaultNetwork(), name, namespace, id, netnsPath, annotations, options)
+	return err
+}
+```
+addtoNetwork()有个参数是plugin.getDefaultNetwork()，返回的是plugin的defaultNetwork字段，它的类型是一个cniNetwork结构体，它是在kubelet初始化阶段生成的，具体实现因为篇幅原因不便多说，这里只看一下其中的一个关键函数getDefaultCNINetwork(),函数参数是来自kubelet的启动参数--cni-conf-dir(default "/etc/cni/net.d")和--cni-bin-dir(default "/opt/cni/bin")，分别是cni插件配置文件和cni插件二进制执行文件在宿主机的路径。函数里主要做了两件事，一是定义了一个CNIConfig类型的变量cniConfig，把路径/opt/cni/bin传给了Path字段；二是按序查找/etc/cni/net.d下的cni配置文件，把找到的第一个文件解析成NetworkConfigList类型的confList。于是plugin.getDefaultNetwork()返回的是主要由cniConfig和confList组成的cniNetwork
+```go
+//这里需要看一下结构体NetworkConfigList的定义，可以看到NetworkConfigList就是cni配置文件的映射。
+type NetConf struct {
+	CNIVersion string `json:"cniVersion,omitempty"`
+
+	Name         string          `json:"name,omitempty"`
+	Type         string          `json:"type,omitempty"`
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+	IPAM         IPAM            `json:"ipam,omitempty"`
+	DNS          DNS             `json:"dns"`
+
+	RawPrevResult map[string]interface{} `json:"prevResult,omitempty"`
+	PrevResult    Result                 `json:"-"`
+}
+
+type NetworkConfig struct {
+	Network *types.NetConf
+	Bytes   []byte
+}
+
+type NetworkConfigList struct {
+	Name         string
+	CNIVersion   string
+	DisableCheck bool
+	Plugins      []*NetworkConfig
+	Bytes        []byte
+}
+```
+
+
+```go
+/pkg/kubelet/dockershim/network/cni/cni.go
+func getDefaultCNINetwork(confDir string, binDirs []string) (*cniNetwork, error) {
+	files, err := libcni.ConfFiles(confDir, []string{".conf", ".conflist", ".json"})
+	switch {
+	case err != nil:
+		return nil, err
+	case len(files) == 0:
+		return nil, fmt.Errorf("no networks found in %s", confDir)
+	}
+
+	cniConfig := &libcni.CNIConfig{Path: binDirs}
+
+	sort.Strings(files)
+	for _, confFile := range files {
+		var confList *libcni.NetworkConfigList
+		if strings.HasSuffix(confFile, ".conflist") {
+			confList, err = libcni.ConfListFromFile(confFile)
+			if err != nil {
+				klog.Warningf("Error loading CNI config list file %s: %v", confFile, err)
+				continue
+			}
+		} else {
+			conf, err := libcni.ConfFromFile(confFile)
+			if err != nil {
+				klog.Warningf("Error loading CNI config file %s: %v", confFile, err)
+				continue
+			}
+			// Ensure the config has a "type" so we know what plugin to run.
+			// Also catches the case where somebody put a conflist into a conf file.
+			if conf.Network.Type == "" {
+				klog.Warningf("Error loading CNI config file %s: no 'type'; perhaps this is a .conflist?", confFile)
+				continue
+			}
+
+			confList, err = libcni.ConfListFromConf(conf)
+			if err != nil {
+				klog.Warningf("Error converting CNI config file %s to list: %v", confFile, err)
+				continue
+			}
+		}
+		if len(confList.Plugins) == 0 {
+			klog.Warningf("CNI config list %s has no networks, skipping", confFile)
+			continue
+		}
+
+		// Before using this CNI config, we have to validate it to make sure that
+		// all plugins of this config exist on disk
+		caps, err := cniConfig.ValidateNetworkList(context.TODO(), confList)
+		if err != nil {
+			klog.Warningf("Error validating CNI config %v: %v", confList, err)
+			continue
+		}
+
+		klog.V(4).Infof("Using CNI configuration file %s", confFile)
+
+		return &cniNetwork{
+			name:          confList.Name,
+			NetworkConfig: confList,
+			CNIConfig:     cniConfig,
+			Capabilities:  caps,
+		}, nil
+	}
+	return nil, fmt.Errorf("no valid networks found in %s", confDir)
+}
+```
+再回到addToNetwork(),这里就做了一件事：调用AddNetworkList()，但是需要弄清楚这里的三个重要变量都代表什么意义，这非常重要！！！rt表示了调用buildCNIRuntimeConf()返回的一些变量，主要包括containerID，NetNs，IfName和Args，这几个变量在后面会被设置为环境变量来用，cniNet是上面getDefaultNetwork()返回的CNIConfig，它实现了CNI interface，可以发现这个interface下面有十个函数，netConf是上面getDefaultNetwork()返回的NetworkConfig。
+```go
+/pkg/kubelet/dockershim/network/cni/cni.go
+func (plugin *cniNetworkPlugin) addToNetwork(ctx context.Context, network *cniNetwork, podName string, podNamespace string, podSandboxID kubecontainer.ContainerID, podNetnsPath string, annotations, options map[string]string) (cnitypes.Result, error) {
+	rt, err := plugin.buildCNIRuntimeConf(podName, podNamespace, podSandboxID, podNetnsPath, annotations, options)
+	if err != nil {
+		klog.Errorf("Error adding network when building cni runtime conf: %v", err)
+		return nil, err
+	}
+
+	pdesc := podDesc(podNamespace, podName, podSandboxID)
+	netConf, cniNet := network.NetworkConfig, network.CNIConfig
+	klog.V(4).Infof("Adding %s to network %s/%s netns %q", pdesc, netConf.Plugins[0].Network.Type, netConf.Name, podNetnsPath)
+	res, err := cniNet.AddNetworkList(ctx, netConf, rt)
+	if err != nil {
+		klog.Errorf("Error adding %s to network %s/%s: %v", pdesc, netConf.Plugins[0].Network.Type, netConf.Name, err)
+		return nil, err
+	}
+	klog.V(4).Infof("Added %s to network %s: %v", pdesc, netConf.Name, res)
+	return res, nil
+}
+
+func (plugin *cniNetworkPlugin) buildCNIRuntimeConf(podName string, podNs string, podSandboxID kubecontainer.ContainerID, podNetnsPath string, annotations, options map[string]string) (*libcni.RuntimeConf, error) {
+	rt := &libcni.RuntimeConf{
+		ContainerID: podSandboxID.ID,//containerID
+		NetNS:       podNetnsPath,//之前生成的netns path
+		IfName:      network.DefaultInterfaceName,//设置容器网卡，默认是eth0
+		CacheDir:    plugin.cacheDir,
+		Args: [][2]string{//有关pod信息的args,这几个arg是否为空决定了后面在cni插件
+			{"IgnoreUnknown", "1"},
+			{"K8S_POD_NAMESPACE", podNs},
+			{"K8S_POD_NAME", podName},
+			{"K8S_POD_INFRA_CONTAINER_ID", podSandboxID.ID},
+		},
+	}
+    ...
+}
+```
+这里开始就需要移步到CNI的源码里
+```go
+/libcni/api.go
+type CNI interface {
+	AddNetworkList(ctx context.Context, net *NetworkConfigList, rt *RuntimeConf) (types.Result, error)
+	CheckNetworkList(ctx context.Context, net *NetworkConfigList, rt *RuntimeConf) error
+	DelNetworkList(ctx context.Context, net *NetworkConfigList, rt *RuntimeConf) error
+	GetNetworkListCachedResult(net *NetworkConfigList, rt *RuntimeConf) (types.Result, error)
+
+	AddNetwork(ctx context.Context, net *NetworkConfig, rt *RuntimeConf) (types.Result, error)
+	CheckNetwork(ctx context.Context, net *NetworkConfig, rt *RuntimeConf) error
+	DelNetwork(ctx context.Context, net *NetworkConfig, rt *RuntimeConf) error
+	GetNetworkCachedResult(net *NetworkConfig, rt *RuntimeConf) (types.Result, error)
+
+	ValidateNetworkList(ctx context.Context, net *NetworkConfigList) ([]string, error)
+	ValidateNetwork(ctx context.Context, net *NetworkConfig) ([]string, error)
+}
+```
+在CNIConfig实现的CNI的AddNetworkList()里遍历上面netConf的plugins，给每个plugin都是调用了addNetwork()。addNetwork()里先调用ensureExec()初始化CNIConfig的exec字段为一个RawExec结构体，然后调用RawExec实现的FindPath()找到当前插件二进制文件的路径，为了之后真正的执行，比如对于calico插件来说，type是calico，在宿主机的路径就是/opt/cni/bin/calico，最后调用ExecPluginWithResult()。
+```go
+/libcni/api.go
+func (c *CNIConfig) AddNetworkList(ctx context.Context, list *NetworkConfigList, rt *RuntimeConf) (types.Result, error) {
+	var err error
+	var result types.Result
+	for _, net := range list.Plugins {
+		result, err = c.addNetwork(ctx, list.Name, list.CNIVersion, net, result, rt)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err = c.cacheAdd(result, list.Bytes, list.Name, rt); err != nil {
+		return nil, fmt.Errorf("failed to set network %q cached result: %v", list.Name, err)
+	}
+
+	return result, nil
+}
+
+func (c *CNIConfig) addNetwork(ctx context.Context, name, cniVersion string, net *NetworkConfig, prevResult types.Result, rt *RuntimeConf) (types.Result, error) {
+	c.ensureExec()
+	pluginPath, err := c.exec.FindInPath(net.Network.Type, c.Path)
+	...
+	newConf, err := buildOneConfig(name, cniVersion, net, prevResult, rt)
+	return invoke.ExecPluginWithResult(ctx, pluginPath, newConf.Bytes, c.args("ADD", rt), c.exec)
+}
+
+func (c *CNIConfig) ensureExec() invoke.Exec {
+	if c.exec == nil {
+		c.exec = &invoke.DefaultExec{
+			RawExec:       &invoke.RawExec{Stderr: os.Stderr},
+			PluginDecoder: version.PluginDecoder{},
+		}
+	}
+	return c.exec
+}
+```
+注意上面ExecPluginWithResult()的参数c.args("ADD", rt)和下面函数里对这个参数的处理args.AsEnv()，目的是将上面提到的重要变量之一rt的多个字段传给多个环境变量，以及把“ADD”传给CNI_COMMAND。这函数就主要负责调用RawExec实现的ExecPlugin()。
+```go
+/pkg/invoke/exec.go
+func ExecPluginWithResult(ctx context.Context, pluginPath string, netconf []byte, args CNIArgs, exec Exec) (types.Result, error) {
+	...
+	stdoutBytes, err := exec.ExecPlugin(ctx, pluginPath, netconf, args.AsEnv())
+
+	// Plugin must return result in same version as specified in netconf
+	versionDecoder := &version.ConfigDecoder{}
+	confVersion, err := versionDecoder.Decode(netconf)
+	if err != nil {
+		return nil, err
+	}
+
+	return version.NewResult(confVersion, stdoutBytes)
+}
+
+/pkg/invoke/args.go
+env = append(env,
+		"CNI_COMMAND="+args.Command,
+		"CNI_CONTAINERID="+args.ContainerID,
+		"CNI_NETNS="+args.NetNS,
+		"CNI_ARGS="+pluginArgsStr,
+		"CNI_IFNAME="+args.IfName,
+		"CNI_PATH="+args.Path,
+	)
+```
+ExecPlugin()是使用go的os/exec的Command方法执行放在pluginPath的可执行插件，这里把刚设置的环境变量传给command，把上面的NetworkConfig作为标准输入传给command，然后就调用command的Run()。
+```go
+/pkg/invoke/raw_exec.go
+func (e *RawExec) ExecPlugin(ctx context.Context, pluginPath string, stdinData []byte, environ []string) ([]byte, error) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	c := exec.CommandContext(ctx, pluginPath)
+	c.Env = environ
+	c.Stdin = bytes.NewBuffer(stdinData)
+	c.Stdout = stdout
+	c.Stderr = stderr
+	if err := c.Run(); err != nil {
+		return nil, e.pluginErr(err, stdout.Bytes(), stderr.Bytes())
+	}
+    ...
+	return stdout.Bytes(), nil
+}
+```
+Run()调用command的Start()，执行放在pluginPath下的可执行插件。
+```go
+/usr/local/go/src/os/exec/exec.go
+func (c *Cmd) Run() error {
+	if err := c.Start(); err != nil {
+		return err
+	}
+	return c.Wait()
+}
+```
+至此，我们学习了从kubelet因为调谐pod状态而创建infra容器，通过kubelet的启动参数找到所有CNI插件的可执行文件和CNI的配置文件。CNI实现使用go的os/exec的Command方法执行配置文件上的CNI插件，并传给command一些环境变量和一个标准输入，标准输入里是每个CNI插件存放在配置文件的配置。<br />因此对于所有CNI插件来说，都是只要关心如何使用这些环境变量和这个标准输入进行网络配置，包括常见的bridge、ipvaln、macvlan、bandwidth和今天的主角--calico。
+<a name="dDQVz"></a>
+# 2.calico
+calico包含两个插件：calico和calico-ipam。
+<a name="D3UOl"></a>
+## 2.1.calico插件
+从calico.go的main()函数进去，经过下面的调用链：<br />main.go->plugin.Main()->skel.PluginMain()->PluginMainWithError()->&dispatcher{Getenv: os.Getenv,Stdin:  os.Stdin,Stdout: os.Stdout,Stderr: os.Stderr,}).pluginMain()<br />这里有os.Getenv和os.Stdin两个函数，有没有感觉在哪里见过？是的，直觉告诉我刚刚说的环境变量和标准输入应该就是用这两个函数获取，待我们继续往下看是否真的是这样。<br />pluginMain()开始就调用getCmdArgsFromEnv()，从名字上可以判断函数里应该会有发现。
+```go
+
+func (t *dispatcher) pluginMain(cmdAdd, cmdGet, cmdDel func(_ *CmdArgs) error, versionInfo version.PluginInfo, about string) *types.Error {
+	cmd, cmdArgs, err := t.getCmdArgsFromEnv()
+	if err != nil {
+		// Print the about string to stderr when no command is set
+		if t.Getenv("CNI_COMMAND") == "" && about != "" {
+			fmt.Fprintln(t.Stderr, about)
+		}
+		return createTypedError(err.Error())
+	}
+
+	if cmd != "VERSION" {
+		err = validateConfig(cmdArgs.StdinData)
+		if err != nil {
+			return createTypedError(err.Error())
+		}
+	}
+
+	switch cmd {
+	case "ADD":
+		err = t.checkVersionAndCall(cmdArgs, versionInfo, cmdAdd)
+	case "GET":
+		configVersion, err := t.ConfVersionDecoder.Decode(cmdArgs.StdinData)
+		if err != nil {
+			return createTypedError(err.Error())
+		}
+		if gtet, err := version.GreaterThanOrEqualTo(configVersion, "0.4.0"); err != nil {
+			return createTypedError(err.Error())
+		} else if !gtet {
+			return &types.Error{
+				Code: types.ErrIncompatibleCNIVersion,
+				Msg:  "config version does not allow GET",
+			}
+		}
+		for _, pluginVersion := range versionInfo.SupportedVersions() {
+			gtet, err := version.GreaterThanOrEqualTo(pluginVersion, configVersion)
+			if err != nil {
+				return createTypedError(err.Error())
+			} else if gtet {
+				if err := t.checkVersionAndCall(cmdArgs, versionInfo, cmdGet); err != nil {
+					return createTypedError(err.Error())
+				}
+				return nil
+			}
+		}
+		return &types.Error{
+			Code: types.ErrIncompatibleCNIVersion,
+			Msg:  "plugin version does not allow GET",
+		}
+	case "DEL":
+		err = t.checkVersionAndCall(cmdArgs, versionInfo, cmdDel)
+	case "VERSION":
+		err = versionInfo.Encode(t.Stdout)
+	default:
+		return createTypedError("unknown CNI_COMMAND: %v", cmd)
+	}
+	...
+}
+```
+进入getCmdArgsFromEnv()，第一眼就能看到vars这个结构体切片，每个切片元素的name字段我们非常熟悉，正是之前重要变量rt传递给的环境变量，仔细看还能发现stdinData, err := ioutil.ReadAll(t.Stdin)这一行代码，正是把标准输入传给stdinData，所以这里环境变量和标准输入变成了cmdArgs，cmd在这里就是“ADD”，说明我们刚才的直觉是正确的。
+```go
+/
+func (t *dispatcher) getCmdArgsFromEnv() (string, *CmdArgs, error) {
+	var cmd, contID, netns, ifName, args, path string
+
+	vars := []struct {
+		name      string
+		val       *string
+		reqForCmd reqForCmdEntry
+	}{
+		{
+			"CNI_COMMAND",
+			&cmd,
+			reqForCmdEntry{
+				"ADD": true,
+				"GET": true,
+				"DEL": true,
+			},
+		},
+		{
+			"CNI_CONTAINERID",
+			&contID,
+			reqForCmdEntry{
+				"ADD": true,
+				"GET": true,
+				"DEL": true,
+			},
+		},
+		{
+			"CNI_NETNS",
+			&netns,
+			reqForCmdEntry{
+				"ADD": true,
+				"GET": true,
+				"DEL": false,
+			},
+		},
+		{
+			"CNI_IFNAME",
+			&ifName,
+			reqForCmdEntry{
+				"ADD": true,
+				"GET": true,
+				"DEL": true,
+			},
+		},
+		{
+			"CNI_ARGS",
+			&args,
+			reqForCmdEntry{
+				"ADD": false,
+				"GET": false,
+				"DEL": false,
+			},
+		},
+		{
+			"CNI_PATH",
+			&path,
+			reqForCmdEntry{
+				"ADD": true,
+				"GET": true,
+				"DEL": true,
+			},
+		},
+	}
+
+	argsMissing := false
+	for _, v := range vars {
+		*v.val = t.Getenv(v.name)
+		if *v.val == "" {
+			if v.reqForCmd[cmd] || v.name == "CNI_COMMAND" {
+				fmt.Fprintf(t.Stderr, "%v env variable missing\n", v.name)
+				argsMissing = true
+			}
+		}
+	}
+
+	if argsMissing {
+		return "", nil, fmt.Errorf("required env variables missing")
+	}
+
+	if cmd == "VERSION" {
+		t.Stdin = bytes.NewReader(nil)
+	}
+
+	stdinData, err := ioutil.ReadAll(t.Stdin)
+	if err != nil {
+		return "", nil, fmt.Errorf("error reading from stdin: %v", err)
+	}
+
+	cmdArgs := &CmdArgs{
+		ContainerID: contID,
+		Netns:       netns,
+		IfName:      ifName,
+		Args:        args,
+		Path:        path,
+		StdinData:   stdinData,
+	}
+	return cmd, cmdArgs, nil
+}
+```
+好了，环境变量咱有了，含有插件配置的标准输入咱也有了，插件执行就是顺水推舟的事。回到上一层pluginMain()，用了一个switch-case语句，不管你是add还是delete还是get，最后都是执行checkVersionAndCall()，看来这个函数里有乾坤啊。<br />checkVersionAndCall()就干了一件事：toCall(cmdArgs)。toCall是啥？toCall必定是负责真正网络配置的逻辑。回到上一层pluginMain()再看一眼调用函数的参数，toCall对应的是cmdAdd。心细的我们可以从图-1发现cmdAdd从skel.PluginMain(cmdAdd, nil, cmdDel,cniSpecVersion.PluginSupports("0.1.0", "0.2.0", "0.3.0", "0.3.1"),"Calico CNI plugin "+version)就有了。不难找出cmdAdd()的位置。
+```go
+
+func (t *dispatcher) checkVersionAndCall(cmdArgs *CmdArgs, pluginVersionInfo version.PluginInfo, toCall func(*CmdArgs) error) *types.Error {
+	...
+	if err = toCall(cmdArgs); err != nil {
+		...
+	}
+	return nil
+}
+```
+<a name="5OBH4"></a>
+## 2.2.calico的庐山真面目
+
+
+```go
+func cmdAdd(args *skel.CmdArgs) error {
+	// 解析标准输入，传给NetConf配置
+	conf := types.NetConf{}
+	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
+		return fmt.Errorf("failed to load netconf: %v", err)
+	}
+	...
+    // 获取节点名，要么从NetConf配置取，要么从主机/var/lib/calico/nodename路径获取
+    nodename := utils.DetermineNodename(conf)
+    // 通过cni传过来的args获取一个workloadendpoint接入calico网络需要的一些标识，包括节点名，容器管理平台(k8s)，pod名，网卡名
+    wepIDs, err := utils.GetIdentifiers(args, nodename)
+    // 创建client，根据conf定义的datastore type选择不同的datasore client，现在有etcd和k8s api两种选择。
+    // client可以对多种calico相关的crd进行CRUD操作，比如workloadendpoint
+	calicoClient, err := utils.CreateClient(conf)
+	...
+	wepIDs.Endpoint = ""
+    // 通过得到的webIDs，可以构建出一个workloadendpoint在calico网络中的唯一名称，比如node1-k8s-mypod--1-eth0
+    // 去掉网卡名,webIDs可以构建出一个workloadendpoint在calico网络中的唯一名称的前缀，比如node1-k8s-mypod--1-
+	wepPrefix, err := wepIDs.CalculateWorkloadEndpointName(true)
+
+	// 通过calicoclient获取满足前缀是“node1-k8s-mypod--1-”的所有已经存在的workloadendpoint，比如node1-k8s-mypod--1-eth1
+    endpoints, err := calicoClient.WorkloadEndpoints().List(ctx, options.ListOptions{Name: wepPrefix, Namespace: wepIDs.Namespace, Prefix: true})
+	...
+	var endpoint *api.WorkloadEndpoint
+
+	
+	if len(endpoints.Items) > 0 {
+		for _, ep := range endpoints.Items {
+            // 对得到的workloadenpoint还需要判断一下是否真正满足条件，因为比如说得到的workloadenpoint是
+			match, err := wepIDs.WorkloadEndpointIdentifiers.NameMatches(ep.Name)
+			if match {
+                // 如果有满足条件的workloadendpoint存在，就需要重用旧的网卡，因为目前k8s一个pod还不支持多个网卡。
+				endpoint = &ep
+				wepIDs.WEPName = endpoint.Name
+				wepIDs.Endpoint = ep.Spec.Endpoint
+				break
+			}
+		}
+	}
+    // 如果没有满足条件的workloadendpoint存在，就只能用原来的args.ifName(eth0)创建新的网卡。
+	if endpoint == nil {
+		wepIDs.Endpoint = args.IfName
+		wepIDs.WEPName, err = wepIDs.CalculateWorkloadEndpointName(false)
+	}
+    // 这里Orchestrator是容器管理平台k8s，调用CmdAddK8s()
+	if wepIDs.Orchestrator == api.OrchestratorKubernetes {
+		if result, err = k8s.CmdAddK8s(ctx, args, conf, *wepIDs, calicoClient, endpoint); err != nil {
+	} else {
+		// 默认的CNI
+		...
+	}
+
+	// Handle profile creation - this is only done if there isn't a specific policy handler.
+	if conf.Policy.PolicyType == "" {
+		logger.Debug("Handling profiles")
+		// Start by checking if the profile already exists. If it already exists then there is no work to do.
+		// The CNI plugin never updates a profile.
+		exists := true
+		_, err = calicoClient.Profiles().Get(ctx, conf.Name, options.GetOptions{})
+		if err != nil {
+			_, ok := err.(cerrors.ErrorResourceDoesNotExist)
+			if ok {
+				exists = false
+			} else {
+				// Cleanup IP allocation and return the error.
+				utils.ReleaseIPAllocation(logger, conf, args)
+				return err
+			}
+		}
+
+		if !exists {
+			// The profile doesn't exist so needs to be created. The rules vary depending on whether k8s is being used.
+			// Under k8s (without full policy support) the rule is permissive and allows all traffic.
+			// Otherwise, incoming traffic is only allowed from profiles with the same tag.
+			logger.Infof("Calico CNI creating profile: %s", conf.Name)
+			var inboundRules []api.Rule
+			if wepIDs.Orchestrator == api.OrchestratorKubernetes {
+				inboundRules = []api.Rule{{Action: api.Allow}}
+			} else {
+				inboundRules = []api.Rule{{Action: api.Allow, Source: api.EntityRule{Selector: fmt.Sprintf("has(%s)", conf.Name)}}}
+			}
+
+			profile := &api.Profile{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: conf.Name,
+				},
+				Spec: api.ProfileSpec{
+					Egress:        []api.Rule{{Action: api.Allow}},
+					Ingress:       inboundRules,
+					LabelsToApply: map[string]string{conf.Name: ""},
+				},
+			}
+
+			logger.WithField("profile", profile).Info("Creating profile")
+
+			if _, err := calicoClient.Profiles().Create(ctx, profile, options.SetOptions{}); err != nil {
+				// Cleanup IP allocation and return the error.
+				utils.ReleaseIPAllocation(logger, conf, args)
+				return err
+			}
+		}
+	}
+
+	// Set Gateway to nil. Calico IPAM doesn't set it, but host-local does.
+	// We modify IPs subnet received from the IPAM plugin (host-local),
+	// so Gateway isn't valid anymore. It is also not used anywhere by Calico.
+	for _, ip := range result.IPs {
+		ip.Gateway = nil
+	}
+
+	// Print result to stdout, in the format defined by the requested cniVersion.
+	return cnitypes.PrintResult(result, conf.CNIVersion)
+}
+```
+GetIdentifiers()就是通过args把容器ID，节点名，网卡名(eth0)，容器管理平台(k8s)，pod名和namespace作为workloadendpoint的标识返回。
+```go
+func GetIdentifiers(args *skel.CmdArgs, nodename string) (*WEPIdentifiers, error) {
+	// Determine if running under k8s by checking the CNI args
+	k8sArgs := types.K8sArgs{}
+	if err := cnitypes.LoadArgs(args.Args, &k8sArgs); err != nil {
+	...
+	epIDs := WEPIdentifiers{}
+	epIDs.ContainerID = args.ContainerID
+	epIDs.Node = nodename
+	epIDs.Endpoint = args.IfName
+	// K8S_POD_NAMESPACE和K8S_POD_NAME就是上面提到过的被cni插件用来判断容器是否跑在k8s上的arg。
+    // 显然我们现在是分析跑在k8s上的pod。
+	if string(k8sArgs.K8S_POD_NAMESPACE) != "" && string(k8sArgs.K8S_POD_NAME) != "" {
+		epIDs.Orchestrator = "k8s"
+		epIDs.Pod = string(k8sArgs.K8S_POD_NAME)
+		epIDs.Namespace = string(k8sArgs.K8S_POD_NAMESPACE)
+	} else {
+		epIDs.Orchestrator = "cni"
+		epIDs.Pod = ""
+		// For any non-k8s orchestrator we set the namespace to default.
+		epIDs.Namespace = "default"
+		...
+	}
+	return &epIDs, nil
+}
+```
+CmdAddK8s()主要做了两件事：一是调用ipam插件分配ip和路由，这里当ipam插件是host-local或者calico-ipam时还需要做一些初始化；二是<br />函数里调用的AddIPAM()或者ipAddrsResult()都会经过一系列调用，最终执行和calico插件处在同一宿主机目录下的ipam插件，ipam插件如何分配ip地址，且看下一小节。
+```go
+func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epIDs utils.WEPIdentifiers, calicoClient calicoclient.Interface, endpoint *api.WorkloadEndpoint) (*current.Result, error) {
+	var result *current.Result
+	// Allocate the IP and update/create the endpoint. Do this even if the endpoint already exists and has an IP
+	// allocation. The kubelet will send a DEL call for any old containers and we'll clean up the old IPs then.
+	client, err := newK8sClient(conf, logger)
+	var routes []*net.IPNet
+    // cni配置文件获取ipam type是host-local的情况下
+	if conf.IPAM.Type == "host-local" {
+		var stdinData map[string]interface{}
+		if err := json.Unmarshal(args.StdinData, &stdinData); err != nil {
+			return nil, err
+		}
+        // 获取node节点的node.Spec.PodCIDR
+		getRealPodCIDR := func() (string, error) {
+			if cachedPodCidr == "" {
+				cachedPodCidr, err = getPodCidr(client, conf, epIDs.Node)
+			}
+			return cachedPodCidr, nil
+		}
+        // 如果ipam下的subnet字段值是“usePodCidr“，就需要把node的PodCIDR赋给subnet字段
+		err = utils.ReplaceHostLocalIPAMPodCIDRs(logger, stdinData, getRealPodCIDR)
+		// 更新后的数据传回给args，供host-local调用
+		args.StdinData, err = json.Marshal(stdinData)
+
+		// 获取ipam下的dst字段值用作配置路由
+		ipamData := stdinData["ipam"].(map[string]interface{})
+		untypedRoutes := ipamData["routes"]
+		hlRoutes, ok := untypedRoutes.([]interface{})
+		if untypedRoutes != nil && !ok {
+		for _, route := range hlRoutes {
+			route := route.(map[string]interface{})
+			untypedDst, ok := route["dst"]
+			dst, ok := untypedDst.(string)
+			_, cidr, err := net.ParseCIDR(dst)
+			routes = append(routes, cidr)
+		}
+	}
+	if conf.Policy.PolicyType == "k8s" {
+        // k8s api获取当前ns的annotation
+		annotNS, err := getK8sNSInfo(client, epIDs.Namespace)
+        // k8s api获取当前pod的一些信息
+		labels, annot, ports, profiles, generateName, err = getK8sPodInfo(client, epIDs.Pod, epIDs.Namespace)
+
+		// cni配置文件获取ipam type是calico-ipam的情况下
+		if conf.IPAM.Type == "calico-ipam" {
+			// 从annotation获取当前ns的ippool
+			v4pools = annotNS["cni.projectcalico.org/ipv4pools"]
+			v6pools = annotNS["cni.projectcalico.org/ipv6pools"]
+			// 同样从pod的annotation获取当前pod的ippool，优先选择pod的ippool
+			v4poolpod := annot["cni.projectcalico.org/ipv4pools"]
+			if len(v4poolpod) != 0 {
+				v4pools = v4poolpod
+			}
+			v6poolpod := annot["cni.projectcalico.org/ipv6pools"]
+			if len(v6poolpod) != 0 {
+				v6pools = v6poolpod
+			}
+            // 把最终选择的ippool传回给args，被calico-ipam使用
+            ...
+		}
+	}
+	// 从pod的annotation获取当前pod的ipAddrsNoIpam，ipAddrs
+	ipAddrsNoIpam := annot["cni.projectcalico.org/ipAddrsNoIpam"]
+	ipAddrs := annot["cni.projectcalico.org/ipAddrs"]
+
+	// ipAddrs和ipAddrsNoIpam是calico-ipam支持为pod分配固定ip的实现，但不可以同时设置，
+    // ipAddrs和ipAddrsNoIpam都没有设置的话就直接调用ipam插件随机分配ip；
+    // ipAddrs被设置则在调用ipam插件时会使用ipAddrs设置的ip，这里要保证ip在上面选择的ip池中；
+    // ipAddrsNoIpam被设置则不会再调用ipam插件，这里可能存在的ip冲突和路由配置由人工处理。
+	switch {
+	case ipAddrs == "" && ipAddrsNoIpam == "":
+		result, err = utils.AddIPAM(conf, args, logger)
+	case ipAddrs != "" && ipAddrsNoIpam != "":
+		e := fmt.Errorf("can't have both annotations: 'ipAddrs' and 'ipAddrsNoIpam' in use at the same time")
+	case ipAddrsNoIpam != "":
+		overriddenResult, err := overrideIPAMResult(ipAddrsNoIpam, logger)
+		result, err = current.NewResultFromResult(overriddenResult)
+	case ipAddrs != "":
+		result, err = ipAddrsResult(ipAddrs, conf, args, logger)
+	}
+	endpoint.Name = epIDs.WEPName
+	endpoint.Namespace = epIDs.Namespace
+	endpoint.Labels = labels
+	endpoint.GenerateName = generateName
+	endpoint.Spec.Endpoint = epIDs.Endpoint
+	endpoint.Spec.Node = epIDs.Node
+	endpoint.Spec.Orchestrator = epIDs.Orchestrator
+	endpoint.Spec.Pod = epIDs.Pod
+	endpoint.Spec.Ports = ports
+	endpoint.Spec.IPNetworks = []string{}
+
+	// Set the profileID according to whether Kubernetes policy is required.
+	// If it's not, then just use the network name (which is the normal behavior)
+	// otherwise use one based on the Kubernetes pod's profile(s).
+	if conf.Policy.PolicyType == "k8s" {
+		endpoint.Spec.Profiles = profiles
+	} else {
+		endpoint.Spec.Profiles = []string{conf.Name}
+	}
+
+	// Populate the endpoint with the output from the IPAM plugin.
+	if err = utils.PopulateEndpointNets(endpoint, result); err != nil {
+		// Cleanup IP allocation and return the error.
+		utils.ReleaseIPAllocation(logger, conf, args)
+		return nil, err
+	}
+
+	// releaseIPAM cleans up any IPAM allocations on failure.
+	releaseIPAM := func() {
+		logger.WithField("endpointIPs", endpoint.Spec.IPNetworks).Info("Releasing IPAM allocation(s) after failure")
+		utils.ReleaseIPAllocation(logger, conf, args)
+	}
+
+	// Whether the endpoint existed or not, the veth needs (re)creating.
+	hostVethName := k8sconversion.VethNameForWorkload(epIDs.Namespace, epIDs.Pod)
+	_, contVethMac, err := utils.DoNetworking(args, conf, result, logger, hostVethName, routes)
+	if err != nil {
+		logger.WithError(err).Error("Error setting up networking")
+		releaseIPAM()
+		return nil, err
+	}
+
+	mac, err := net.ParseMAC(contVethMac)
+	if err != nil {
+		logger.WithError(err).WithField("mac", mac).Error("Error parsing container MAC")
+		releaseIPAM()
+		return nil, err
+	}
+	endpoint.Spec.MAC = mac.String()
+	endpoint.Spec.InterfaceName = hostVethName
+	endpoint.Spec.ContainerID = epIDs.ContainerID
+	logger.WithField("endpoint", endpoint).Info("Added Mac, interface name, and active container ID to endpoint")
+
+	// List of DNAT ipaddrs to map to this workload endpoint
+	floatingIPs := annot["cni.projectcalico.org/floatingIPs"]
+
+	if floatingIPs != "" {
+		// If floating IPs are defined, but the feature is not enabled, return an error.
+		if !conf.FeatureControl.FloatingIPs {
+			releaseIPAM()
+			return nil, fmt.Errorf("requested feature is not enabled: floating_ips")
+		}
+		ips, err := parseIPAddrs(floatingIPs, logger)
+		if err != nil {
+			releaseIPAM()
+			return nil, err
+		}
+
+		for _, ip := range ips {
+			endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, api.IPNAT{
+				InternalIP: result.IPs[0].Address.IP.String(),
+				ExternalIP: ip,
+			})
+		}
+		logger.WithField("endpoint", endpoint).Info("Added floatingIPs to endpoint")
+	}
+
+	// Write the endpoint object (either the newly created one, or the updated one)
+	if _, err := utils.CreateOrUpdate(ctx, calicoClient, endpoint); err != nil {
+		logger.WithError(err).Error("Error creating/updating endpoint in datastore.")
+		releaseIPAM()
+		return nil, err
+	}
+	logger.Info("Wrote updated endpoint to datastore")
+
+	// Add the interface created above to the CNI result.
+	result.Interfaces = append(result.Interfaces, &current.Interface{
+		Name: endpoint.Spec.InterfaceName},
+	)
+
+	return result, nil
+}
+```
+<a name="RvjKr"></a>
+## 2.3.ipam插件
+calico-ipam遵循着同样的cni插件实现方法，所以直接从cmdAdd()开始分析。<br />开始和calico插件做的一样，获取标准输入，创建calicoclient，获取workloadendpoint的相关标识
+```go
+func cmdAdd(args *skel.CmdArgs) error {
+	// 与calico插件开始做的一样，解析args，创建calicoclient，获取workloadendpoint的相关标识
+	...
+	ipamArgs := ipamArgs{}
+	if err = cnitypes.LoadArgs(args.Args, &ipamArgs); err != nil {
+	attrs := map[string]string{ipam.AttributeNode: nodename}
+	if epIDs.Pod != "" {
+		attrs[ipam.AttributePod] = epIDs.Pod
+		attrs[ipam.AttributeNamespace] = epIDs.Namespace
+	}
+	ctx := context.Background()
+	r := &current.Result{}
+	if ipamArgs.IP != nil {
+        // 通过ipAddrs为pod分配固定ip的情况
+		assignArgs := ipam.AssignIPArgs{
+			IP:       cnet.IP{IP: ipamArgs.IP},// 这里是分配的固定ip
+			HandleID: &handleID,
+			Hostname: nodename,
+			Attrs:    attrs,
+		}
+		// 分配固定ip
+		err := calicoClient.IPAM().AssignIP(ctx, assignArgs)
+		var ipNetwork net.IPNet
+		if ipamArgs.IP.To4() == nil {
+			ipNetwork = net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(128, 128)}
+			r.IPs = append(r.IPs, &current.IPConfig{
+				Version: "6",
+				Address: ipNetwork,
+			})
+		} else {
+			ipNetwork = net.IPNet{IP: ipamArgs.IP, Mask: net.CIDRMask(32, 32)}
+			r.IPs = append(r.IPs, &current.IPConfig{
+				Version: "4",
+				Address: ipNetwork,
+			})
+		}
+	} else {
+        // 随机分配ip的情况
+		num4 := 1
+		if conf.IPAM.AssignIpv4 != nil && *conf.IPAM.AssignIpv4 == "false" {
+			num4 = 0
+		}
+
+		// Default to NOT assigning an IPv6 address
+		num6 := 0
+		if conf.IPAM.AssignIpv6 != nil && *conf.IPAM.AssignIpv6 == "true" {
+			num6 = 1
+		}
+        // 刚才获取的当前pod和ns的annotation定义的ip池，因为随机分配的ip要从ip池里取
+		v4pools, err := utils.ResolvePools(ctx, calicoClient, conf.IPAM.IPv4Pools, true)
+		v6pools, err := utils.ResolvePools(ctx, calicoClient, conf.IPAM.IPv6Pools, false)
+		assignArgs := ipam.AutoAssignArgs{
+			Num4:      num4,
+			Num6:      num6,
+			HandleID:  &handleID,
+			Hostname:  nodename,
+			IPv4Pools: v4pools,
+			IPv6Pools: v6pools,
+			Attrs:     attrs,
+		}
+        // 分配随机ip
+		assignedV4, assignedV6, err := calicoClient.IPAM().AutoAssign(ctx, assignArgs)
+		if num4 == 1 {
+			if len(assignedV4) != num4 {
+				return fmt.Errorf("failed to request %d IPv4 addresses. IPAM allocated only %d", num4, len(assignedV4))
+			}
+			ipV4Network := net.IPNet{IP: assignedV4[0].IP, Mask: net.CIDRMask(32, 32)}
+			r.IPs = append(r.IPs, &current.IPConfig{
+				Version: "4",
+				Address: ipV4Network,
+			})
+		}
+		if num6 == 1 {
+			if len(assignedV6) != num6 {
+				return fmt.Errorf("failed to request %d IPv6 addresses. IPAM allocated only %d", num6, len(assignedV6))
+			}
+			ipV6Network := net.IPNet{IP: assignedV6[0].IP, Mask: net.CIDRMask(128, 128)}
+			r.IPs = append(r.IPs, &current.IPConfig{
+				Version: "6",
+				Address: ipV6Network,
+			})
+		}
+		logger.WithFields(logrus.Fields{"result.IPs": r.IPs}).Info("IPAM Result")
+	}
+
+	return cnitypes.PrintResult(r, conf.CNIVersion)
+}
+```
+先看一下AssignIP()如何分配固定ip：<br />这里需要先了解一个calico分配ip的概念：block，block是一个ip地址的区块，是一个ip池的子网段，分配ip是从某一个ip池的某一个block里选择一个ip，举个例子：
+```yaml
+如果有个ip池cidr是192.169.0.0/24，blocksize是29，要分配的ip是192.169.0.34，则block区块就是192.169.0.32/29,里面有8-2个ip地址
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: test
+spec:
+  cidr: 192.169.0.0/24
+  blockSize: 29
+  ipipMode: Always
+  natOutgoing: true
+```
+```go
+func (c ipamClient) AssignIP(ctx context.Context, args AssignIPArgs) error {
+	hostname, err := decideHostname(args.Hostname)
+    // 根据指定的固定ip查找含有这个ip的ip池
+	pool, err := c.blockReaderWriter.getPoolForIP(args.IP, nil)
+	// 根据指定的固定ip从上面的ip池查找对应的blockCIDR
+	blockCIDR := getBlockCIDRForAddress(args.IP, pool)
+	for i := 0; i < datastoreRetries; i++ {
+        // 根据blockCIDR查找block
+		obj, err := c.blockReaderWriter.queryBlock(ctx, blockCIDR, "")
+		if err != nil {
+			cfg, err := c.GetIPAMConfig(ctx)
+			pa, err := c.blockReaderWriter.getPendingAffinity(ctx, hostname, blockCIDR)
+			obj, err = c.blockReaderWriter.claimAffineBlock(ctx, pa, *cfg)
+		}
+		block := allocationBlock{obj.Value.(*model.AllocationBlock)}
+		err = block.assign(args.IP, args.HandleID, args.Attrs, hostname)
+		if args.HandleID != nil {
+			c.incrementHandle(ctx, *args.HandleID, blockCIDR, 1)
+		}
+		_, err = c.blockReaderWriter.updateBlock(ctx, obj)
+		if err != nil {
+			if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+				log.WithError(err).Debug("CAS error assigning IP - retry")
+				continue
+			}
+
+			log.WithError(err).Warningf("Update failed on block %s", block.CIDR.String())
+			if args.HandleID != nil {
+				if err := c.decrementHandle(ctx, *args.HandleID, blockCIDR, 1); err != nil {
+					log.WithError(err).Warn("Failed to decrement handle")
+				}
+			}
+			return err
+		}
+		return nil
+	}
+	return errors.New("Max retries hit - excessive concurrent IPAM requests")
+}
+```
