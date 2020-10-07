@@ -32,7 +32,7 @@ HPA目前支持的度量类型主要包含两种Pod和Resource，剩下的虽然
 # 2.核心实现
 HPA控制器的实现，主要分为如下部分：获取scale对象、根据区间进行快速决策, 然后就是核心实现根据伸缩算法根据当前的metric、当前副本、伸缩策略来进行最终期望副本的计算，让我们依次来看下关键实现
 ## 2.1 根据ScaleTargetRef来获取scale对象
-主要是根据神器scheme来获取对应的版本，然后在通过版本获取对应的Resource的scale对象
+主要是根据schema来获取对应的版本，然后在通过版本获取对应的Resource的scale对象
 
 代码路径`pkg/controller/podautoscaler/horizontal.go`
 ```go
@@ -152,6 +152,8 @@ func (h *HeapsterMetricsClient) GetRawMetric(metricName string, namespace string
 ### 2.5.2 期望副本计算实现
 期望副本的计算实现主要是在calcPlainMetricReplicas中，这里需要考虑的东西比较多，根据我的理解，我将这部分拆成一段段，方便读者理解，这些代码都属于calcPlainMetricReplicas<br />
 
+代码路径`pkg/controller/podautoscaler/replica_calculator.go:168`
+
 > 1.在获取监控数据的时候，对应的Pod可能会有三种情况：
 
 ```go
@@ -212,7 +214,7 @@ if math.Abs(1.0-newUsageRatio) <= c.tolerance || (usageRatio < 1.0 && newUsageRa
     }
 ```
 在经过上述的修正数据后，会重新进行使用率计算即newUsageRatio，如果发现计算后的值在容忍范围之内，当前是0.1，则就会进行任何的伸缩操作<br />
-<br />反之在重新计算使用率之后，如果我们原本使用率<1.0即未达到阈值，进行数据填充后，现在却超过1.0，则不应该进行任何操作，为啥呢？因为原本ready的所有节点使用率<1.0，但你现在计算超出了1.0，则就应该缩放，你要是吧ready的缩放了，并且之前那些未知的节点依旧宕机，则就要重新进行扩容，这是不是在做无用功呢？<br />
+<br />反之在重新计算使用率之后，如果我们原本使用率<1.0即未达到阈值，进行数据填充后，现在newUsageRatio却超过1.0，则不应该进行任何操作，为啥呢？因为原本ready的所有节点使用率<1.0，但你现在计算超出了1.0，则就应该缩放，你要是把ready的缩放了，并且之前那些未知的节点依旧宕机，则就要重新进行扩容，这是不是在做无用功呢？<br />
 
 ## 2.6 带Behavior的稳定性决策
 ![image](../images/不带be决策.png)
