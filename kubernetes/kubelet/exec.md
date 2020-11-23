@@ -210,3 +210,11 @@ web-console基于websocket实现，在浏览器和后端之间建立websocket连
 
 - gateone：cka考试时使用的web shell就是基于gateone实现。含前端，python开发
 - gotty：完整的web shell实现，含前端，golang编写，方便二次开发
+
+# 参考
+- http://blog.daocloud.io/allen_2/
+- https://blog.haohtml.com/archives/19151
+- https://cloud.tencent.com/developer/article/1416063
+- https://erkanerol.github.io/post/how-kubectl-exec-works/
+- https://hui.lu/shi-yong-tornado-cao-zuo-docker-api/#run-bash-with-docker-api
+- https://aleiwu.com/post/kubectl-debug-intro/
